@@ -1,6 +1,8 @@
 {
   "steps": [
     { "name": "get categories", "folder": "get_categories" },
-    { "name": "get books", "folder": "get_book_links" }
+    { "name": "get books", "folder": "get_book_links" },
+    { "name": "get download links", "folder": "get_download_links" },
+    { "name": "download books", "folder": "download_books" }
   ]
 }
