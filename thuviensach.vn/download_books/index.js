@@ -7,8 +7,11 @@
 //   2. Read the filename from `Content-Disposition` (with a sanitized
 //      fallback derived from the URL + a content-type extension).
 //   3. Stream the response body to <project-root>/result/downloaded/<file>.
+//   4. Append the link to result/download_log.jsonl once it finishes.
 //
-// Files that already exist on disk are skipped, so the run is resumable.
+// Before downloading, each link is checked against that log; links already
+// present are skipped. Files that already exist on disk are also skipped, so
+// the run is resumable. Use --overwrite to ignore both checks and re-download.
 //
 // Parallelism:
 //   The script prompts for the number of parallel threads (default 1).
@@ -32,6 +35,10 @@ const { request } = require('playwright');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const INPUT_FILE = path.join(PROJECT_ROOT, 'result', 'download_links.json');
 const OUTPUT_DIR = path.join(PROJECT_ROOT, 'result', 'downloaded');
+// Append-only log (JSON Lines) recording every link that finished downloading.
+// On startup we read it back so already-downloaded links are skipped, making
+// the run resumable even if the downloaded files are moved or renamed.
+const LOG_FILE = path.join(PROJECT_ROOT, 'result', 'download_log.jsonl');
 
 const DEFAULT_THREADS = 1;
 const MAX_THREADS = 32;
@@ -118,6 +125,31 @@ async function resolveDelayMs() {
 function sleep(ms) {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Read the download log and return a Set of links already downloaded.
+// Tolerates a missing file and skips any malformed lines.
+function loadDownloadedLinks() {
+  const done = new Set();
+  if (!fs.existsSync(LOG_FILE)) return done;
+  const content = fs.readFileSync(LOG_FILE, 'utf8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      if (entry && entry.link) done.add(entry.link);
+    } catch (_err) {
+      // Ignore corrupt lines so a partial write can't break the next run.
+    }
+  }
+  return done;
+}
+
+// Append one record to the log. appendFileSync is blocking, and Node runs JS
+// single-threaded, so concurrent workers can't interleave a partial write.
+function appendToLog(entry) {
+  fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
 }
 
 // Live status block, redrawn in-place on TTYs.
@@ -299,6 +331,8 @@ async function downloadOne(reqCtx, item, slotId) {
       result.ok = true;
       result.file = target;
       result.skipped = true;
+      // The file already has data on disk; report its real size instead of 0.
+      result.bytes = fs.statSync(target).size;
       return result;
     }
     if (OVERWRITE && fs.existsSync(target)) {
@@ -333,12 +367,23 @@ async function main() {
   }
 
   const all = JSON.parse(fs.readFileSync(INPUT_FILE, 'utf8'));
-  const queue = all
+  const selected = all
     .slice(START_FROM, START_FROM + MAX_LINKS)
     .filter((x) => x && x.link);
 
+  // Links recorded in the log are considered done and updated by all workers
+  // during the run. Filter them out up front (unless --overwrite) so the queue
+  // only contains links that still need downloading.
+  const downloadedLinks = loadDownloadedLinks();
+  const queue = OVERWRITE
+    ? selected
+    : selected.filter((x) => !downloadedLinks.has(x.link));
+  const alreadyDone = selected.length - queue.length;
+
   if (queue.length === 0) {
-    console.log('Nothing to download.');
+    console.log(
+      `Nothing to download. ${selected.length} link đã có trong log ${LOG_FILE}.`
+    );
     return;
   }
 
@@ -346,10 +391,13 @@ async function main() {
   const delayMs = await resolveDelayMs();
   const delayDesc =
     delayMs === 0 ? 'không delay' : `delay ${delayMs / 1000}s giữa các lần tải`;
+
   console.log(
     `Sẽ tải ${queue.length} file vào ${OUTPUT_DIR} với ${threads} luồng song song (${delayDesc}).`
   );
-  console.log('(File đã tồn tại sẽ được bỏ qua, dùng --overwrite để tải lại.)');
+  console.log(
+    `(Đã lọc bỏ ${alreadyDone} link đã có trong log ${LOG_FILE}, dùng --overwrite để tải lại.)`
+  );
   console.log('');
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -392,8 +440,19 @@ async function main() {
           STATE.skipped += 1;
         } else {
           STATE.ok += 1;
-          STATE.bytes += result.bytes || 0;
         }
+        // Count bytes for both fresh and already-on-disk files.
+        STATE.bytes += result.bytes || 0;
+        // Record the link as downloaded so subsequent runs skip it.
+        downloadedLinks.add(item.link);
+        appendToLog({
+          link: item.link,
+          title: item.title || null,
+          file: result.file ? path.basename(result.file) : null,
+          bytes: result.bytes || 0,
+          skipped: Boolean(result.skipped),
+          time: new Date().toISOString(),
+        });
       } else {
         STATE.failed += 1;
         logAbove(`ERROR [${item.link}]: ${result.error}`);
