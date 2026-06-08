@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "name": "get books link",
+      "folder": "get_books_link"
+    }
+  ]
+}
