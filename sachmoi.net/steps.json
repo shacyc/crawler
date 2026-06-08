@@ -3,6 +3,10 @@
     {
       "name": "get books link",
       "folder": "get_books_link"
+    },
+    {
+      "name": "get download links",
+      "folder": "get_download_links"
     }
   ]
 }
