@@ -7,6 +7,10 @@
     {
       "name": "get download links",
       "folder": "get_download_links"
+    },
+    {
+      "name": "download books",
+      "folder": "download_books"
     }
   ]
 }
