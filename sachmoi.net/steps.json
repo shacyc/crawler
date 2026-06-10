@@ -11,6 +11,10 @@
     {
       "name": "download books",
       "folder": "download_books"
+    },
+    {
+      "name": "handle not downloaded books",
+      "folder": "handle_not_downloaded_books"
     }
   ]
 }
