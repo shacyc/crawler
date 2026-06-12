@@ -14,11 +14,16 @@
 //        Whatever responds with a real file is saved; formats that only return
 //        an HTML page (i.e. the format is not available) are skipped.
 //   drive.google.com
-//     Opens the landing page in a real (Chromium) browser, finds every <div>
-//     whose text is exactly "download", and clicks them one by one. After each
-//     click it waits ~3s for a browser download to start; the first click that
-//     produces a file wins (we save it and stop), otherwise it moves on to the
-//     next button. Chromium is launched lazily, only when a Drive link is hit.
+//     Uses a real (Chromium) browser, launched lazily only when a Drive link
+//     is hit.
+//       - Single file: downloaded named after the book, following Google's
+//         "virus scan warning" confirm page when it appears.
+//       - Folder: every file inside is enumerated recursively (descending into
+//         subfolders) and the folder link is replaced in not_downloaded_books
+//         by the individual /file/d/<id>/view child links. By default downloads
+//         are PAUSED for folders — the children are only listed for review.
+//         Pass --download-folders to actually download them (recreating the
+//         folder structure under result/downloaded/<book>/, one file at a time).
 //
 // Outcome per book:
 //   - If at least one file was downloaded (for any link / any format) the book
@@ -38,14 +43,22 @@
 //                   (default 0 = no delay)
 //   --overwrite     re-download files that already exist on disk
 //   --headed        run the Chromium browser with a visible window (drive.google.com)
+//   --download-folders  actually download Drive folder contents (default: only
+//                       list the child file links into not_downloaded for review)
 //
 // On an interactive terminal the script also prompts for concurrency and delay
-// at startup (pressing Enter keeps the value shown in brackets).
+// at startup (pressing Enter keeps the value shown in brackets), and shows a
+// live per-worker progress line for each active download: bytes received, total
+// size (when the server reports it), current speed, and a "stalled Ns" warning
+// when no new bytes have arrived recently — so a dead/hung transfer is obvious.
 
 const fs = require('fs');
+const os = require('os');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const readline = require('readline');
-const { request, chromium } = require('playwright');
+const { chromium } = require('playwright');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const RESULT_DIR = path.join(PROJECT_ROOT, 'result');
@@ -54,6 +67,40 @@ const DOWNLOADED_FILE = path.join(RESULT_DIR, 'downloaded_books.json');
 const NOT_DOWNLOADED_FILE = path.join(RESULT_DIR, 'not_downloaded_books.json');
 
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per file
+
+const USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// Chromium streams in-progress downloads to a "<guid>.crdownload" file under
+// its downloadsPath; we poll that file to show live download progress. The dir
+// is created lazily (only the Drive handler needs the browser at all).
+let DOWNLOADS_TMP = null;
+function downloadsTmpDir() {
+  if (!DOWNLOADS_TMP) {
+    DOWNLOADS_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'crawler-dl-'));
+  }
+  return DOWNLOADS_TMP;
+}
+// Paths of *.crdownload files already attributed to a worker, so concurrent
+// downloads each track their own file rather than fighting over one.
+const claimedCrdownloads = new Set();
+function claimCrdownload() {
+  let entries;
+  try {
+    entries = fs.readdirSync(downloadsTmpDir());
+  } catch (_err) {
+    return null;
+  }
+  for (const name of entries) {
+    if (!name.endsWith('.crdownload')) continue;
+    const p = path.join(DOWNLOADS_TMP, name);
+    if (claimedCrdownloads.has(p)) continue;
+    claimedCrdownloads.add(p);
+    return p;
+  }
+  return null;
+}
 
 // Formats to probe on taisachhay.net, in priority order.
 const TAISACHHAY_TYPES = ['azw3', 'epub', 'mobi', 'pdf', 'prc', 'zip', 'cbz'];
@@ -74,6 +121,11 @@ const MAX_BOOKS = ARGS['max-books'] ? parseInt(ARGS['max-books'], 10) : Infinity
 const START_FROM = ARGS['start'] ? parseInt(ARGS['start'], 10) : 0;
 const OVERWRITE = Boolean(ARGS['overwrite']);
 const HEADED = Boolean(ARGS['headed']);
+
+// When false (current default), a Drive folder is only expanded into its child
+// file links, which are written back into not_downloaded_books.json for review —
+// no files are downloaded. Pass --download-folders to actually download them.
+const DOWNLOAD_FOLDER_FILES = Boolean(ARGS['download-folders']);
 
 // How long to let a Drive page settle (SPA render) before scanning for buttons.
 const PAGE_SETTLE_MS = 2500;
@@ -154,6 +206,51 @@ function fmtBytes(b) {
   return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+// ---- Per-worker live download progress -----------------------------------
+// A slot's `dl` holds the in-flight download so renderStatus can show how many
+// bytes have arrived, the total (when known), the speed, and — crucially — how
+// long it has been since the last byte, so a stalled/dead transfer is obvious.
+function setSlotDownload(slot, label, total) {
+  if (!slot) return;
+  slot.dl = {
+    label: label || slot.label,
+    total: total || 0,
+    bytes: 0,
+    start: Date.now(),
+    lastByteTime: Date.now(),
+    samples: [],
+    speed: 0,
+  };
+}
+function setSlotBytes(slot, bytes) {
+  if (!slot || !slot.dl) return;
+  if (bytes > slot.dl.bytes) slot.dl.lastByteTime = Date.now();
+  slot.dl.bytes = bytes;
+}
+function addSlotBytes(slot, n) {
+  if (!slot || !slot.dl) return;
+  slot.dl.bytes += n;
+  slot.dl.lastByteTime = Date.now();
+}
+function clearSlotDownload(slot) {
+  if (slot) slot.dl = null;
+}
+
+// Recompute each active download's speed from a short rolling window. Called by
+// the once-a-second heartbeat so the rate keeps updating even between chunks.
+function refreshSpeeds() {
+  const now = Date.now();
+  for (const slot of STATE.active) {
+    const d = slot.dl;
+    if (!d) continue;
+    d.samples.push({ t: now, b: d.bytes });
+    while (d.samples.length > 6) d.samples.shift();
+    const first = d.samples[0];
+    const span = now - first.t;
+    d.speed = span >= 500 ? ((d.bytes - first.b) / span) * 1000 : d.speed;
+  }
+}
+
 function renderStatus() {
   const lines = [
     `Books    : ${STATE.done}/${STATE.total}  ` +
@@ -162,7 +259,21 @@ function renderStatus() {
   ];
   if (STATE.active.length > 0) {
     for (const slot of STATE.active) {
-      lines.push(`[t${slot.id}] ${slot.label}`);
+      const d = slot.dl;
+      if (d) {
+        let p = fmtBytes(d.bytes);
+        if (d.total) {
+          p += ` / ${fmtBytes(d.total)} (${Math.floor(
+            (d.bytes / d.total) * 100
+          )}%)`;
+        }
+        p += ` @ ${fmtBytes(d.speed)}/s`;
+        const idle = Date.now() - d.lastByteTime;
+        if (idle > 4000) p += `  !! stalled ${Math.floor(idle / 1000)}s`;
+        lines.push(`[t${slot.id}] ${d.label} — ${p}`);
+      } else {
+        lines.push(`[t${slot.id}] ${slot.label}`);
+      }
     }
   } else {
     lines.push('(idle)');
@@ -237,41 +348,77 @@ function domainOf(link) {
   }
 }
 
-// A response is a "direct" file download when it's OK and the body is not an
-// HTML/landing page. A format that taisachhay.net does not provide answers with
-// an HTML page (the homepage / an error), which we treat as "not available".
-function isDirectDownload(response) {
-  if (!response.ok()) return false;
-  const ct = (response.headers()['content-type'] || '').toLowerCase();
-  if (!ct) return true; // no type at all -> treat as a raw file
-  return !(ct.includes('text/html') || ct.includes('application/xhtml'));
+// Issue a streaming GET and resolve with the live response stream *before* its
+// body is consumed, so the caller can both inspect headers (to reject HTML
+// landing pages) and report download progress chunk by chunk. Redirects are
+// followed manually so the final stream still carries Content-Length.
+function streamHttpGet(url, headers, redirectsLeft = 20) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const mod = u.protocol === 'http:' ? http : https;
+    const req = mod.get(u, { headers }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume(); // drain the redirect body
+        if (redirectsLeft <= 0) {
+          reject(new Error('too many redirects'));
+          return;
+        }
+        const next = new URL(res.headers.location, u).toString();
+        resolve(streamHttpGet(next, headers, redirectsLeft - 1));
+        return;
+      }
+      resolve({ res, status, headers: res.headers });
+    });
+    req.on('error', reject);
+    req.setTimeout(REQUEST_TIMEOUT_MS, () =>
+      req.destroy(new Error('request timeout'))
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Generic single-URL downloader. Saves the body under <book name>.<ext> in
-// OUTPUT_DIR. Returns { file, bytes } on success or null when the URL is not a
-// direct file download.
+// Generic single-URL downloader. Streams the body to <book name>.<ext> in
+// OUTPUT_DIR, updating `slot` with live progress. Returns { file, bytes } on
+// success or null when the URL is not a direct file download.
 // ---------------------------------------------------------------------------
-async function downloadToFile(reqCtx, book, url, ext) {
-  let response;
+async function downloadToFile(book, url, ext, slot) {
+  const dottedExt = ext ? (ext.startsWith('.') ? ext : `.${ext}`) : '';
+  const baseName = sanitizeFilename(book.name) + dottedExt;
+
+  let resp;
   try {
-    response = await reqCtx.get(url, {
-      timeout: REQUEST_TIMEOUT_MS,
-      maxRedirects: 20,
+    resp = await streamHttpGet(url, {
+      'User-Agent': USER_AGENT,
+      Referer: 'https://taisachhay.net/',
+      // Keep the body identity-encoded so streamed byte counts match the file.
+      'Accept-Encoding': 'identity',
     });
   } catch (_err) {
     return null;
   }
 
-  if (!isDirectDownload(response)) return null;
-
-  const dottedExt = ext ? (ext.startsWith('.') ? ext : `.${ext}`) : '';
-  const baseName = sanitizeFilename(book.name) + dottedExt;
+  const { res, status, headers } = resp;
+  const ct = (headers['content-type'] || '').toLowerCase();
+  const isHtml = ct.includes('text/html') || ct.includes('application/xhtml');
+  // A format taisachhay.net does not have answers with an HTML page; treat
+  // anything non-200 or HTML as "not a real file" and discard it.
+  if (status !== 200 || isHtml) {
+    res.resume();
+    return null;
+  }
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
   let target = path.join(OUTPUT_DIR, baseName);
   if (fs.existsSync(target) && !OVERWRITE) {
+    res.resume();
     return {
       file: path.basename(target),
       bytes: fs.statSync(target).size,
@@ -284,52 +431,133 @@ async function downloadToFile(reqCtx, book, url, ext) {
     target = path.join(OUTPUT_DIR, uniqueFilename(OUTPUT_DIR, baseName));
   }
 
-  const body = await response.body();
-  fs.writeFileSync(target, body);
-  return { file: path.basename(target), bytes: body.length };
-}
+  const total = parseInt(headers['content-length'] || '0', 10) || 0;
+  setSlotDownload(slot, baseName, total);
 
-// Persist a Playwright `Download` to OUTPUT_DIR, named after the book and
-// keeping the server-suggested extension. Returns { file, bytes, skipped? }.
-async function saveDownload(book, download) {
-  const suggested = download.suggestedFilename() || '';
-  let ext = path.extname(suggested);
-  if (ext.length > 6) ext = ''; // reject bogus "extensions" that are really text
-  const baseName = sanitizeFilename(book.name) + ext.toLowerCase();
-
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-  let target = path.join(OUTPUT_DIR, baseName);
-  if (fs.existsSync(target) && !OVERWRITE) {
-    await download.cancel().catch(() => {});
-    return {
-      file: path.basename(target),
-      bytes: fs.statSync(target).size,
-      skipped: true,
-    };
+  const out = fs.createWriteStream(target);
+  try {
+    await new Promise((resolve, reject) => {
+      res.on('data', (chunk) => addSlotBytes(slot, chunk.length));
+      res.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', resolve);
+      res.pipe(out);
+    });
+  } catch (_err) {
+    out.destroy();
+    if (fs.existsSync(target)) {
+      try {
+        fs.unlinkSync(target);
+      } catch (_unlinkErr) {
+        // ignore partial-file cleanup failure
+      }
+    }
+    clearSlotDownload(slot);
+    return null;
   }
-  if (OVERWRITE && fs.existsSync(target)) {
-    fs.unlinkSync(target);
-  } else if (!OVERWRITE) {
-    target = path.join(OUTPUT_DIR, uniqueFilename(OUTPUT_DIR, baseName));
-  }
+  clearSlotDownload(slot);
 
-  await download.saveAs(target);
   const bytes = fs.existsSync(target) ? fs.statSync(target).size : 0;
   return { file: path.basename(target), bytes };
 }
 
+// Persist a Playwright `Download` into `dir`. When `baseName` is given the file
+// is renamed to `<baseName><server-extension>` (used for single-file books);
+// otherwise the server-suggested filename is kept (used for folder contents).
+// The returned `file` is a path relative to OUTPUT_DIR so it stays meaningful
+// for files saved inside a per-book subfolder.
+async function persistDownload(download, dir, baseName, slot) {
+  const suggested = download.suggestedFilename() || 'download';
+  let fileName;
+  if (baseName) {
+    let ext = path.extname(suggested);
+    if (ext.length > 6) ext = ''; // reject bogus "extensions" that are really text
+    fileName = sanitizeFilename(baseName) + ext.toLowerCase();
+  } else {
+    fileName = sanitizeFilename(suggested);
+  }
+
+  fs.mkdirSync(dir, { recursive: true });
+
+  let target = path.join(dir, fileName);
+  if (fs.existsSync(target) && !OVERWRITE) {
+    await download.cancel().catch(() => {});
+    return {
+      file: path.relative(OUTPUT_DIR, target),
+      bytes: fs.statSync(target).size,
+      skipped: true,
+    };
+  }
+  if (OVERWRITE && fs.existsSync(target)) {
+    fs.unlinkSync(target);
+  } else if (!OVERWRITE && fs.existsSync(target)) {
+    target = path.join(dir, uniqueFilename(dir, fileName));
+  }
+
+  // Playwright only exposes the file once the browser finishes downloading, so
+  // for live progress we poll the matching <guid>.crdownload that Chromium is
+  // actively writing under DOWNLOADS_TMP while saveAs() waits.
+  setSlotDownload(slot, path.basename(target), 0);
+  let stopWatch = false;
+  const watcher = slot
+    ? (async () => {
+        let fp = null;
+        for (let i = 0; i < 80 && !stopWatch && !fp; i += 1) {
+          fp = claimCrdownload();
+          if (!fp) await sleep(150);
+        }
+        while (!stopWatch) {
+          if (fp) {
+            try {
+              setSlotBytes(slot, fs.statSync(fp).size);
+            } catch (_statErr) {
+              // file renamed/removed on completion — stop reading it
+            }
+          }
+          await sleep(400);
+        }
+        if (fp) claimedCrdownloads.delete(fp);
+      })()
+    : null;
+
+  try {
+    await download.saveAs(target);
+  } catch (err) {
+    if (fs.existsSync(target)) {
+      try {
+        fs.unlinkSync(target);
+      } catch (_unlinkErr) {
+        // ignore partial file cleanup failures
+      }
+    }
+    await download.cancel().catch(() => {});
+    return null;
+  } finally {
+    stopWatch = true;
+    if (watcher) await watcher.catch(() => {});
+    clearSlotDownload(slot);
+  }
+  const bytes = fs.existsSync(target) ? fs.statSync(target).size : 0;
+  return { file: path.relative(OUTPUT_DIR, target), bytes };
+}
+
 // ---------------------------------------------------------------------------
-// Per-domain handlers. Each is called as handler(deps, book, linkEntry) and
-// returns an array of downloaded file descriptors
-//   { link, domain, file, bytes }
-// (empty when nothing could be downloaded from the given link). `deps` exposes
-// { reqCtx, getBrowser } so a handler can use the plain HTTP client or a real
-// browser as needed.
+// Per-domain handlers. Each is called as handler(deps, book, linkEntry, slot)
+// and returns { files, remaining } where:
+//   files     downloaded file descriptors { link, domain, file, bytes } to add
+//             to downloaded_books.json
+//   remaining link entries that should stay in not_downloaded_books.json *in
+//             place of* the input link (e.g. a folder expanded into the
+//             individual file links that could not be downloaded). When nothing
+//             was downloaded and nothing else is returned, the original link is
+//             kept by the caller.
+// `deps` exposes { getBrowser } so a handler can spin up a real browser when it
+// needs one (taisachhay.net streams over plain HTTP without it). `slot` is the
+// worker's live-status entry, updated with download progress.
 // ---------------------------------------------------------------------------
 
 // taisachhay.net: probe every known format via the download endpoint.
-async function handleTaisachhay(deps, book, linkEntry) {
+async function handleTaisachhay(deps, book, linkEntry, slot) {
   const sourceLink = linkEntry.link;
   let bookId = null;
   try {
@@ -337,7 +565,7 @@ async function handleTaisachhay(deps, book, linkEntry) {
   } catch (_err) {
     bookId = null;
   }
-  if (!bookId) return [];
+  if (!bookId) return { files: [], remaining: [linkEntry] };
 
   const files = [];
   for (const type of TAISACHHAY_TYPES) {
@@ -345,7 +573,7 @@ async function handleTaisachhay(deps, book, linkEntry) {
       type
     )}&book_id=${encodeURIComponent(bookId)}`;
 
-    const result = await downloadToFile(deps.reqCtx, book, dl, type);
+    const result = await downloadToFile(book, dl, type, slot);
     if (result) {
       files.push({
         link: dl,
@@ -360,7 +588,7 @@ async function handleTaisachhay(deps, book, linkEntry) {
     }
     if (DELAY_MS > 0) await sleep(DELAY_MS);
   }
-  return files;
+  return { files, remaining: [] };
 }
 
 // Click a candidate button and resolve with the resulting Playwright Download
@@ -402,62 +630,328 @@ async function clickForDownload(context, locator) {
   return download;
 }
 
-// drive.google.com: open the page in a browser and click every <div> whose
-// text is a download label, waiting after each click for a download to start.
-// The first click that yields a file wins.
-async function handleDriveGoogle(deps, book, linkEntry) {
-  const link = linkEntry.link;
+// Extract the Drive file/folder id from any of the common Drive URL shapes
+// (/file/d/<id>, /drive/folders/<id>, /folders/<id>, /d/<id>, ?id=<id>).
+function extractDriveId(link) {
+  try {
+    const u = new URL(link);
+    const byPath = u.pathname.match(
+      /\/(?:file\/d|drive\/folders|folders|d)\/([^/]+)/
+    );
+    if (byPath) return byPath[1];
+    const byQuery = u.searchParams.get('id');
+    if (byQuery) return byQuery;
+  } catch (_err) {
+    // fall through
+  }
+  return null;
+}
+
+function isDriveFolderLink(link) {
+  return /\/folders\//.test(link || '');
+}
+
+// Download a single Drive file (by id) via the drive.usercontent.google.com
+// endpoint, which either streams the file directly or shows a "virus scan
+// warning" page whose `#uc-download-link` ("Download anyway") submit starts the
+// download. Saves into `dir`, keeping the server filename, or renamed to
+// `baseName` when provided. Returns the saved descriptor or null.
+async function downloadDriveFileById(context, fileId, dir, baseName, slot) {
+  const page = await context.newPage();
+  try {
+    const downloadPromise = context.waitForEvent('download', {
+      timeout: DRIVE_DOWNLOAD_WAIT_MS,
+    });
+
+    await page
+      .goto(
+        `https://drive.usercontent.google.com/download?id=${encodeURIComponent(
+          fileId
+        )}&export=download`,
+        { waitUntil: 'domcontentloaded', timeout: 60000 }
+      )
+      .catch(() => {});
+
+    // Small files may start downloading immediately; larger ones show a
+    // "virus scan warning" page that needs #uc-download-link. Clicking that
+    // button after a download already started cancels it ("saveAs: canceled").
+    let download = await Promise.race([
+      downloadPromise,
+      page.waitForTimeout(1500).then(() => null),
+    ]).catch(() => null);
+
+    if (!download) {
+      const confirm = page.locator('#uc-download-link');
+      const needsConfirm = await confirm
+        .isVisible({ timeout: 2000 })
+        .catch(() => false);
+      if (needsConfirm) {
+        download = await clickForDownload(context, confirm);
+      } else {
+        download = await downloadPromise.catch(() => null);
+      }
+    }
+
+    if (!download) return null;
+    return await persistDownload(download, dir, baseName, slot);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// Read the immediate children of a Drive folder. Returns [{ id, name, isFolder }].
+// Scrolls to coax Drive into rendering long, lazily-loaded lists.
+async function listDriveFolder(page, folderId) {
+  await page
+    .goto(
+      `https://drive.google.com/drive/folders/${encodeURIComponent(folderId)}`,
+      { waitUntil: 'domcontentloaded', timeout: 60000 }
+    )
+    .catch(() => {});
+  await page.waitForTimeout(PAGE_SETTLE_MS);
+
+  let prev = -1;
+  for (let i = 0; i < 30; i += 1) {
+    const count = await page
+      .evaluate(() => document.querySelectorAll('[role="row"][data-id]').length)
+      .catch(() => 0);
+    if (count === prev) break;
+    prev = count;
+    await page
+      .evaluate(() => {
+        const rows = document.querySelectorAll('[role="row"][data-id]');
+        const last = rows[rows.length - 1];
+        if (last) last.scrollIntoView({ block: 'end' });
+      })
+      .catch(() => {});
+    await page.waitForTimeout(600);
+  }
+
+  return page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('[role="row"][data-id]'));
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+      const id = r.getAttribute('data-id');
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const labeled = r.querySelector('[aria-label]');
+      const aria =
+        (labeled
+          ? labeled.getAttribute('aria-label')
+          : r.getAttribute('aria-label')) || '';
+      const img = r.querySelector('img, svg');
+      const imgAlt = img ? img.getAttribute('alt') || '' : '';
+      const isFolder = /thư mục|\bfolder\b/i.test(aria) || /folder/i.test(imgAlt);
+      // Strip the trailing "shared" / folder-type tokens Drive appends.
+      const name = aria
+        .replace(/\s+(Đã chia sẻ|Shared)\s*$/i, '')
+        .replace(/\s+(Thư mục dùng chung|Thư mục|Shared folder|Folder)\s*$/i, '')
+        .trim();
+      out.push({ id, name, isFolder });
+    }
+    return out;
+  });
+}
+
+// Recursively flatten a Drive folder into a list of files, preserving each
+// file's relative folder path. Guards against cycles and runaway trees.
+async function expandDriveFolder(page, rootId) {
+  const MAX_FILES = 1000;
+  const files = [];
+  const seen = new Set();
+  const stack = [{ id: rootId, rel: '' }];
+
+  while (stack.length > 0 && files.length < MAX_FILES) {
+    const { id, rel } = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    let items = [];
+    try {
+      items = await listDriveFolder(page, id);
+    } catch (_err) {
+      items = [];
+    }
+
+    for (const it of items) {
+      if (it.isFolder) {
+        const childRel = rel
+          ? `${rel}/${sanitizeFilename(it.name)}`
+          : sanitizeFilename(it.name);
+        stack.push({ id: it.id, rel: childRel });
+      } else {
+        files.push({ id: it.id, name: it.name, rel });
+      }
+    }
+  }
+  return files;
+}
+
+// drive.google.com folder: enumerate every file inside (recursively), recreate
+// the folder structure under result/downloaded/<book>/ and download each file
+// one by one. The original folder link is effectively replaced by the
+// individual file links; files that fail to download are kept in
+// not_downloaded_books.json as those individual file links.
+async function handleDriveFolder(deps, book, linkEntry, folderId, slot) {
   const browser = await deps.getBrowser();
   const context = await browser.newContext({
     acceptDownloads: true,
-    userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    userAgent: USER_AGENT,
   });
-  const page = await context.newPage();
   const files = [];
+  const remaining = [];
 
   try {
+    const navPage = await context.newPage();
+    let expanded = [];
     try {
-      await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch (_err) {
-      // Navigation timeouts are tolerated — the page may still be usable.
+      expanded = await expandDriveFolder(navPage, folderId);
+    } finally {
+      await navPage.close().catch(() => {});
     }
-    await page.waitForTimeout(PAGE_SETTLE_MS);
 
-    // Tag every matching <div> so we can click them by a stable selector.
-    // Mirrors the user-provided snippet (extended with the Vietnamese label):
-    //   Array.from(document.querySelectorAll('div'))
-    //     .filter(el => el.textContent.trim().toLowerCase() === 'download')
-    const count = await page.evaluate((labels) => {
-      const els = Array.from(document.querySelectorAll('div')).filter((el) =>
-        labels.includes(el.textContent.trim().toLowerCase())
-      );
-      els.forEach((el, i) => el.setAttribute('data-dlbtn', String(i)));
-      return els.length;
-    }, DOWNLOAD_LABELS);
+    if (expanded.length === 0) {
+      // Could not read the folder — keep the original link to retry later.
+      remaining.push(linkEntry);
+      return { files, remaining };
+    }
 
-    for (let i = 0; i < count; i += 1) {
-      const locator = page.locator(`[data-dlbtn="${i}"]`);
-      const download = await clickForDownload(context, locator);
-      if (download) {
-        const saved = await saveDownload(book, download);
+    const bookDir = sanitizeFilename(book.name);
+
+    // Download paused: just list the child file links for review. The folder
+    // link is replaced in not_downloaded_books.json by these individual links.
+    if (!DOWNLOAD_FOLDER_FILES) {
+      logAbove(`FOLDER [${book.name}]: listed ${expanded.length} child file(s)`);
+      for (const f of expanded) {
+        remaining.push({
+          link: `https://drive.google.com/file/d/${f.id}/view`,
+          domain: 'drive.google.com',
+          name: f.name,
+          path: f.rel || undefined,
+          reason: 'expanded from folder (download paused)',
+        });
+      }
+      return { files, remaining };
+    }
+
+    logAbove(`FOLDER [${book.name}]: downloading ${expanded.length} file(s)`);
+
+    for (const f of expanded) {
+      const fileLink = `https://drive.google.com/file/d/${f.id}/view`;
+      const destDir = path.join(OUTPUT_DIR, bookDir, f.rel);
+      const saved = await downloadDriveFileById(context, f.id, destDir, null, slot);
+      if (saved) {
         files.push({
-          link,
+          link: fileLink,
           domain: 'drive.google.com',
           file: saved.file,
           bytes: saved.bytes,
         });
         if (!saved.skipped) STATE.bytes += saved.bytes || 0;
         STATE.files += 1;
-        break; // got the file — stop clicking further buttons
+      } else {
+        remaining.push({
+          link: fileLink,
+          domain: 'drive.google.com',
+          name: f.name,
+          path: f.rel || undefined,
+          reason: 'file download failed',
+        });
       }
+      if (DELAY_MS > 0) await sleep(DELAY_MS);
     }
   } finally {
     await context.close().catch(() => {});
   }
 
-  return files;
+  return { files, remaining };
+}
+
+// drive.google.com single file: download it (named after the book). Uses the
+// direct endpoint when the file id is known, otherwise opens the landing page
+// and clicks the "download" button, following Google's virus-scan confirm popup.
+async function handleDriveSingleFile(deps, book, linkEntry, fileId, slot) {
+  const browser = await deps.getBrowser();
+  const context = await browser.newContext({
+    acceptDownloads: true,
+    userAgent: USER_AGENT,
+  });
+  const files = [];
+
+  const record = (saved) => {
+    files.push({
+      link: linkEntry.link,
+      domain: 'drive.google.com',
+      file: saved.file,
+      bytes: saved.bytes,
+    });
+    if (!saved.skipped) STATE.bytes += saved.bytes || 0;
+    STATE.files += 1;
+  };
+
+  try {
+    if (fileId) {
+      const saved = await downloadDriveFileById(
+        context,
+        fileId,
+        OUTPUT_DIR,
+        book.name,
+        slot
+      );
+      if (saved) {
+        record(saved);
+        return { files, remaining: [] };
+      }
+    }
+
+    // Fallback: open the landing page and click the "download" button(s),
+    // mirroring the user-provided snippet (extended with the Vietnamese label).
+    const page = await context.newPage();
+    try {
+      await page
+        .goto(linkEntry.link, { waitUntil: 'domcontentloaded', timeout: 60000 })
+        .catch(() => {});
+      await page.waitForTimeout(PAGE_SETTLE_MS);
+
+      const count = await page.evaluate((labels) => {
+        const els = Array.from(document.querySelectorAll('div')).filter((el) =>
+          labels.includes(el.textContent.trim().toLowerCase())
+        );
+        els.forEach((el, i) => el.setAttribute('data-dlbtn', String(i)));
+        return els.length;
+      }, DOWNLOAD_LABELS);
+
+      for (let i = 0; i < count; i += 1) {
+        const download = await clickForDownload(
+          context,
+          page.locator(`[data-dlbtn="${i}"]`)
+        );
+        if (download) {
+          record(await persistDownload(download, OUTPUT_DIR, book.name, slot));
+          break;
+        }
+      }
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } finally {
+    await context.close().catch(() => {});
+  }
+
+  return { files, remaining: files.length > 0 ? [] : [linkEntry] };
+}
+
+// drive.google.com dispatcher: folders are expanded and downloaded file by
+// file; single files are downloaded directly.
+async function handleDriveGoogle(deps, book, linkEntry, slot) {
+  const link = linkEntry.link;
+  const id = extractDriveId(link);
+  if (isDriveFolderLink(link)) {
+    if (!id) return { files: [], remaining: [linkEntry] };
+    return handleDriveFolder(deps, book, linkEntry, id, slot);
+  }
+  return handleDriveSingleFile(deps, book, linkEntry, id, slot);
 }
 
 const HANDLERS = {
@@ -512,16 +1006,20 @@ async function processBook(deps, book, slotId) {
         continue;
       }
 
-      const files = await handler(deps, book, linkEntry);
+      const result = await handler(deps, book, linkEntry, slot);
+      const files = (result && result.files) || [];
+      const remaining = (result && result.remaining) || [];
+
       if (files.length > 0) {
         downloadedFiles.push(...files);
         logAbove(
-          `OK   [${book.name}] ${domain}: ${files
-            .map((f) => f.file)
-            .join(', ')}`
+          `OK   [${book.name}] ${domain}: ${files.length} file(s)`
         );
-      } else {
-        // Handler ran but found nothing downloadable — keep the link around.
+      }
+      for (const r of remaining) remainingLinks.push(r);
+
+      if (files.length === 0 && remaining.length === 0) {
+        // Nothing downloaded and nothing returned — keep the original link.
         remainingLinks.push({
           ...linkEntry,
           reason: 'no direct-download format available',
@@ -583,26 +1081,32 @@ async function main() {
     return;
   }
 
-  const reqCtx = await request.newContext({
-    userAgent:
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    extraHTTPHeaders: {
-      Referer: 'https://taisachhay.net/',
-    },
-  });
-
   // Chromium is only needed by the browser-driven handlers (drive.google.com),
-  // so launch it lazily and reuse the single instance across workers.
+  // so launch it lazily and reuse the single instance across workers. A known
+  // downloadsPath lets us watch the in-progress <guid>.crdownload file to report
+  // live download progress.
   let browserPromise = null;
   const getBrowser = () => {
     if (!browserPromise) {
-      browserPromise = chromium.launch({ headless: !HEADED });
+      browserPromise = chromium.launch({
+        headless: !HEADED,
+        downloadsPath: downloadsTmpDir(),
+      });
     }
     return browserPromise;
   };
 
-  const deps = { reqCtx, getBrowser };
+  const deps = { getBrowser };
+
+  // Heartbeat: refresh download speeds and redraw the status block once a second
+  // so the user can see progress (and spot a stalled transfer) between events.
+  const heartbeat = IS_TTY
+    ? setInterval(() => {
+        refreshSpeeds();
+        renderStatus();
+      }, 1000)
+    : null;
+  if (heartbeat && heartbeat.unref) heartbeat.unref();
 
   let pendingWrite = false;
   const flush = () => {
@@ -640,7 +1144,18 @@ async function main() {
       cursor += 1;
 
       const book = queue[idx];
-      const outcome = await processBook(deps, book, slotId);
+      let outcome;
+      try {
+        outcome = await processBook(deps, book, slotId);
+      } catch (err) {
+        logAbove(
+          `ERR  [${book.name || book.url}]: ${err.message || String(err)}`
+        );
+        outcome = {
+          downloaded: null,
+          remainingLinks: book.links || [],
+        };
+      }
 
       if (outcome.downloaded) {
         upsertDownloaded(outcome.downloaded);
@@ -674,12 +1189,19 @@ async function main() {
       )
     );
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
     writeJson(DOWNLOADED_FILE, downloadedResults);
     writeJson(NOT_DOWNLOADED_FILE, notDownloadedResults.filter(Boolean));
-    await reqCtx.dispose();
     if (browserPromise) {
       const browser = await browserPromise.catch(() => null);
       if (browser) await browser.close().catch(() => {});
+    }
+    if (DOWNLOADS_TMP) {
+      try {
+        fs.rmSync(DOWNLOADS_TMP, { recursive: true, force: true });
+      } catch (_rmErr) {
+        // ignore temp-dir cleanup failure
+      }
     }
   }
 
